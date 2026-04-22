@@ -1,0 +1,37 @@
+name: Daily Idiosyncratic Alpha Run
+
+on:
+  schedule:
+    - cron: "45 22 * * 1-5"   # 22:45 UTC Mon–Fri (after market close + data lag)
+  workflow_dispatch:
+
+jobs:
+  run-idiosyn-alpha:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330        # 5.5h ceiling — well inside 6h free tier
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run engine
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python trainer.py
+
+      - name: Upload log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: idiosyn-alpha-log-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 7
