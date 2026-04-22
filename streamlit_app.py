@@ -94,7 +94,10 @@ st.sidebar.divider()
 st.sidebar.markdown("### 📅 Market calendar")
 st.sidebar.markdown(f"**Last run:** {latest_run.strftime('%a %d %b %Y') if latest_run else '—'}")
 st.sidebar.markdown(f"**Next trading day:** {next_td.strftime('%a %d %b %Y')}")
-st.sidebar.success("Today is a trading day") if is_today else st.sidebar.info("Market closed today")
+if is_today:
+    st.sidebar.success("Today is a trading day")
+else:
+    st.sidebar.info("Market closed today")
 st.sidebar.markdown(f"*{n_dates} trading days in history*")
 st.sidebar.divider()
 st.sidebar.markdown("### ⚙️ Engine parameters")
