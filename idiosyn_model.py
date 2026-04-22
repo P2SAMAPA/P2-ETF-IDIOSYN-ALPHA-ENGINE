@@ -17,6 +17,7 @@ from config import (
     BENCHMARKS, OLS_WINDOWS, PRIMARY_WINDOW,
     USE_DCC_GARCH, DCC_LOOKBACK_DAYS,
     GARCH_P, GARCH_Q,
+    DCC_MLE_X0, DCC_MLE_BOUNDS, DCC_MLE_MAXITER,
     ALPHA_WINDOW_WEIGHTS, ANNUALISE_FACTOR,
     TOP_N_CONVICTION,
 )
@@ -35,22 +36,29 @@ def estimate_dcc_betas(
     lookback: int = DCC_LOOKBACK_DAYS,
 ) -> dict[str, float]:
     """
-    Fit a DCC-GARCH(1,1) model to estimate today's time-varying betas.
-    Returns {benchmark: beta} for the most recent observation.
+    Fit a full DCC-GARCH(1,1) model with daily MLE re-estimation of the
+    DCC parameters (a, b) — no fixed/hardcoded values.
 
-    Falls back to rolling OLS if arch is unavailable or fitting fails.
-    The DCC approach:
-      - Fit univariate GARCH(1,1) to each series for conditional variance
-      - Apply DCC correlation update equations to get Σ_t
-      - Beta_i = Cov(etf, bench_i) / Var(bench_i) from Σ_t
+    Pipeline:
+      1. Fit univariate GARCH(1,1) to ETF + each benchmark → standardised
+         residuals and conditional volatilities.
+      2. Run MLE on the DCC log-likelihood over the standardised residuals
+         to find optimal (a*, b*) for today's 252-day window.
+      3. Apply the DCC recursion with (a*, b*) to build Q_T (conditional
+         pseudo-correlation matrix).
+      4. Construct Σ_T = D_T · R_T · D_T (conditional covariance).
+      5. Beta_i = Cov(etf, bench_i) / Var(bench_i) from Σ_T.
+
+    Falls back to rolling OLS if arch is unavailable or MLE fails.
     """
     try:
         from arch import arch_model
+        from scipy.optimize import minimize
     except ImportError:
-        log.warning("arch library not available — falling back to OLS")
+        log.warning("arch or scipy not available — falling back to OLS")
         return _ols_betas(etf_series, bench_df, PRIMARY_WINDOW)
 
-    # Align and take lookback window
+    # ── Align and slice to lookback window ────────────────────────────────────
     common = etf_series.index.intersection(bench_df.index)
     etf_w  = etf_series.loc[common].iloc[-lookback:]
     bch_w  = bench_df[BENCHMARKS].loc[common].iloc[-lookback:]
@@ -59,67 +67,110 @@ def estimate_dcc_betas(
         return _ols_betas(etf_series, bench_df, PRIMARY_WINDOW)
 
     try:
-        # ── Step 1: fit univariate GARCH(1,1) to each series, get std residuals ──
-        all_series = {f"etf": etf_w}
+        # ── Step 1: univariate GARCH(1,1) on each series ──────────────────────
+        all_series = {"etf": etf_w}
         for b in BENCHMARKS:
             all_series[b] = bch_w[b]
 
         std_resids = {}
         cond_vols  = {}
         for name, series in all_series.items():
-            s = series.dropna() * 100  # scale to percent for numerical stability
+            s  = series.dropna() * 100   # scale to % for numerical stability
             am = arch_model(s, vol="Garch", p=GARCH_P, q=GARCH_Q, rescale=False)
             res = am.fit(disp="off", show_warning=False)
             std_resids[name] = res.std_resid.values
             cond_vols[name]  = res.conditional_volatility.values
 
-        # Trim to common length
+        # Trim all series to the same length
         min_len = min(len(v) for v in std_resids.values())
         for k in std_resids:
             std_resids[k] = std_resids[k][-min_len:]
             cond_vols[k]  = cond_vols[k][-min_len:]
 
-        # ── Step 2: DCC correlation recursion ──────────────────────────────────
-        # Q_bar = unconditional correlation of std residuals
-        keys = ["etf"] + BENCHMARKS
-        n    = len(keys)
-        T    = min_len
-
+        keys  = ["etf"] + BENCHMARKS
+        T     = min_len
         e_mat = np.column_stack([std_resids[k] for k in keys])  # T × n
-        Q_bar = np.cov(e_mat.T)  # n × n unconditional
+        Q_bar = np.cov(e_mat.T)                                  # n × n
 
-        dcc_a = 0.05
-        dcc_b = 0.93
-        Q_t   = Q_bar.copy()
+        # ── Step 2: MLE re-estimation of DCC parameters (a*, b*) ─────────────
+        # DCC log-likelihood (Engle 2002, eq. 12):
+        #   L_DCC = -½ Σ_t [ log|R_t| + ε_t' R_t⁻¹ ε_t - ε_t'ε_t ]
+        # We maximise this over (a, b) subject to a>0, b>0, a+b<1.
 
-        # Iterate DCC to get final Q_T
+        def _dcc_loglik(params: np.ndarray) -> float:
+            a, b = params
+            if a <= 0 or b <= 0 or a + b >= 1:
+                return 1e10   # infeasible — large penalty
+            Q_t   = Q_bar.copy()
+            total = 0.0
+            for t in range(1, T):
+                e_t = e_mat[t].reshape(-1, 1)
+                Q_t = (1 - a - b) * Q_bar + a * (e_t @ e_t.T) + b * Q_t
+                # Convert to correlation
+                diag_sqrt_inv = np.diag(1.0 / np.sqrt(np.maximum(np.diag(Q_t), 1e-12)))
+                R_t = diag_sqrt_inv @ Q_t @ diag_sqrt_inv
+                # Log-likelihood contribution
+                try:
+                    sign, log_det = np.linalg.slogdet(R_t)
+                    if sign <= 0:
+                        return 1e10
+                    R_inv = np.linalg.inv(R_t)
+                    e_t_flat = e_mat[t]
+                    quad = e_t_flat @ R_inv @ e_t_flat
+                    total += log_det + quad - (e_t_flat @ e_t_flat)
+                except np.linalg.LinAlgError:
+                    return 1e10
+            return total   # minimise negative log-likelihood (already negated)
+
+        # Optimise — start from typical DCC values, bounded search
+        result = minimize(
+            _dcc_loglik,
+            x0=DCC_MLE_X0,
+            method="L-BFGS-B",
+            bounds=DCC_MLE_BOUNDS,
+            options={"maxiter": DCC_MLE_MAXITER, "ftol": 1e-9},
+        )
+
+        if result.success or result.fun < 1e9:
+            dcc_a, dcc_b = result.x
+            # Enforce stationarity constraint a + b < 1
+            if dcc_a + dcc_b >= 1.0:
+                dcc_a, dcc_b = DCC_MLE_X0
+        else:
+            log.warning("DCC MLE did not converge — using default starting values")
+            dcc_a, dcc_b = DCC_MLE_X0
+
+        log.debug(f"DCC MLE params: a={dcc_a:.4f}, b={dcc_b:.4f} "
+                  f"(a+b={dcc_a+dcc_b:.4f})")
+
+        # ── Step 3: DCC recursion with MLE-estimated (a*, b*) ─────────────────
+        Q_t = Q_bar.copy()
         for t in range(1, T):
             e_t = e_mat[t].reshape(-1, 1)
             Q_t = (1 - dcc_a - dcc_b) * Q_bar + dcc_a * (e_t @ e_t.T) + dcc_b * Q_t
 
-        # Convert Q_T to correlation R_T
-        D_inv = np.diag(1.0 / np.sqrt(np.diag(Q_t)))
-        R_t   = D_inv @ Q_t @ D_inv
+        diag_sqrt_inv = np.diag(1.0 / np.sqrt(np.maximum(np.diag(Q_t), 1e-12)))
+        R_t           = diag_sqrt_inv @ Q_t @ diag_sqrt_inv
 
-        # ── Step 3: conditional covariance Σ_T ────────────────────────────────
-        d_t   = np.array([cond_vols[k][-1] for k in keys]) / 100  # back to decimal
+        # ── Step 4: conditional covariance Σ_T = D_T · R_T · D_T ─────────────
+        d_t   = np.array([cond_vols[k][-1] for k in keys]) / 100   # decimal
         D_t   = np.diag(d_t)
-        Sigma = D_t @ R_t @ D_t  # n × n conditional covariance
+        Sigma = D_t @ R_t @ D_t
 
-        # ── Step 4: betas = Cov(etf, bench_i) / Var(bench_i) ──────────────────
+        # ── Step 5: betas = Cov(etf, bench_i) / Var(bench_i) ─────────────────
         etf_idx = 0
         betas   = {}
-        for i, b in enumerate(BENCHMARKS):
-            b_idx = keys.index(b)
+        for b in BENCHMARKS:
+            b_idx  = keys.index(b)
             cov_eb = Sigma[etf_idx, b_idx]
             var_b  = Sigma[b_idx, b_idx]
-            betas[b] = cov_eb / var_b if var_b > 1e-10 else 0.0
+            betas[b] = float(cov_eb / var_b) if var_b > 1e-10 else 0.0
 
-        log.debug(f"DCC betas: {betas}")
+        log.debug(f"DCC betas (MLE a={dcc_a:.3f}, b={dcc_b:.3f}): {betas}")
         return betas
 
     except Exception as exc:
-        log.warning(f"DCC-GARCH failed ({exc}) — using OLS fallback")
+        log.warning(f"DCC-GARCH MLE failed ({exc}) — using OLS fallback")
         return _ols_betas(etf_series, bench_df, PRIMARY_WINDOW)
 
 
