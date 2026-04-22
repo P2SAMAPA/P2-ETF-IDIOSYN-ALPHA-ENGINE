@@ -1,0 +1,11 @@
+numpy>=1.26.0
+pandas>=2.1.0
+scikit-learn>=1.4.0
+arch>=6.3.0
+yfinance>=0.2.38
+datasets>=2.18.0
+huggingface-hub>=0.22.0
+pyarrow>=15.0.0
+requests>=2.31.0
+streamlit>=1.35.0
+plotly>=5.20.0
