@@ -31,14 +31,19 @@ PRIMARY_WINDOW = 63              # window used for today's idiosyncratic return
 
 # ── DCC-GARCH settings ────────────────────────────────────────────────────────
 # DCC-GARCH gives time-varying betas that update daily.
-# Used as the primary beta estimator for today's idiosyncratic return.
-# Falls back to rolling OLS if arch fitting fails.
+# DCC parameters (a, b) are re-estimated via MLE on each daily run using
+# scipy L-BFGS-B optimisation of the Engle (2002) DCC log-likelihood.
+# This adds ~10-15 min to runtime but gives optimal parameters for the
+# current 252-day window rather than using fixed typical values.
+# Falls back to rolling OLS if arch fitting or MLE fails.
 USE_DCC_GARCH      = True
 DCC_LOOKBACK_DAYS  = 252         # data window fed to DCC-GARCH
 GARCH_P            = 1           # GARCH(p,q) order
 GARCH_Q            = 1
-DCC_A              = 0.05        # DCC alpha (news impact)
-DCC_B              = 0.93        # DCC beta  (persistence)
+# DCC_A and DCC_B are no longer fixed — estimated daily via MLE.
+DCC_MLE_X0         = [0.05, 0.93]       # MLE starting point (typical values)
+DCC_MLE_BOUNDS     = [(1e-4, 0.4), (1e-4, 0.9999)]  # bounds for (a, b)
+DCC_MLE_MAXITER    = 200
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
 # Idiosyncratic return (ε): cross-sectional z-score of today's residual
