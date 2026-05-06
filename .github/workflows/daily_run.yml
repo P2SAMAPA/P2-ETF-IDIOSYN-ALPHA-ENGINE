@@ -2,7 +2,7 @@ name: Daily Idiosyncratic Alpha Run
 
 on:
   schedule:
-    - cron: "45 22 * * 1-5"   # 22:45 UTC Mon–Fri (after market close + data lag)
+    - cron: "30 23 * * 1-5"   # 23:30 UTC Mon–Fri (after market close + data lag)
   workflow_dispatch:
 
 jobs:
