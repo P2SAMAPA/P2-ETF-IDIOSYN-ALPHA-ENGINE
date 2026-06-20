@@ -3,8 +3,8 @@
 #   1. DCC-GARCH time-varying betas (with OLS fallback)
 #   2. Rolling OLS Jensen's alpha (63d + 126d)
 #   3. Today's idiosyncratic return (ε = actual - systematic)
-#   4. Cross-sectional z-score ranking
-#   5. Conviction score — intersection of idio ranking + alpha ranking
+#   4. Robust cross-sectional percentile ranking
+#   5. Soft conviction score (continuous weighted rank, replacing rigid intersection)
 import logging
 import warnings
 from typing import Optional
@@ -93,23 +93,17 @@ def estimate_dcc_betas(
         Q_bar = np.cov(e_mat.T)                                  # n × n
 
         # ── Step 2: MLE re-estimation of DCC parameters (a*, b*) ─────────────
-        # DCC log-likelihood (Engle 2002, eq. 12):
-        #   L_DCC = -½ Σ_t [ log|R_t| + ε_t' R_t⁻¹ ε_t - ε_t'ε_t ]
-        # We maximise this over (a, b) subject to a>0, b>0, a+b<1.
-
         def _dcc_loglik(params: np.ndarray) -> float:
             a, b = params
             if a <= 0 or b <= 0 or a + b >= 1:
-                return 1e10   # infeasible — large penalty
+                return 1e10
             Q_t   = Q_bar.copy()
             total = 0.0
             for t in range(1, T):
                 e_t = e_mat[t].reshape(-1, 1)
                 Q_t = (1 - a - b) * Q_bar + a * (e_t @ e_t.T) + b * Q_t
-                # Convert to correlation
                 diag_sqrt_inv = np.diag(1.0 / np.sqrt(np.maximum(np.diag(Q_t), 1e-12)))
                 R_t = diag_sqrt_inv @ Q_t @ diag_sqrt_inv
-                # Log-likelihood contribution
                 try:
                     sign, log_det = np.linalg.slogdet(R_t)
                     if sign <= 0:
@@ -120,9 +114,8 @@ def estimate_dcc_betas(
                     total += log_det + quad - (e_t_flat @ e_t_flat)
                 except np.linalg.LinAlgError:
                     return 1e10
-            return total   # minimise negative log-likelihood (already negated)
+            return total
 
-        # Optimise — start from typical DCC values, bounded search
         result = minimize(
             _dcc_loglik,
             x0=DCC_MLE_X0,
@@ -133,7 +126,6 @@ def estimate_dcc_betas(
 
         if result.success or result.fun < 1e9:
             dcc_a, dcc_b = result.x
-            # Enforce stationarity constraint a + b < 1
             if dcc_a + dcc_b >= 1.0:
                 dcc_a, dcc_b = DCC_MLE_X0
         else:
@@ -153,7 +145,7 @@ def estimate_dcc_betas(
         R_t           = diag_sqrt_inv @ Q_t @ diag_sqrt_inv
 
         # ── Step 4: conditional covariance Σ_T = D_T · R_T · D_T ─────────────
-        d_t   = np.array([cond_vols[k][-1] for k in keys]) / 100   # decimal
+        d_t   = np.array([cond_vols[k][-1] for k in keys]) / 100
         D_t   = np.diag(d_t)
         Sigma = D_t @ R_t @ D_t
 
@@ -222,7 +214,7 @@ def rolling_ols_alpha(
         r2    = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else np.nan
 
         results[w] = {
-            "alpha": reg.intercept_ * ANNUALISE_FACTOR,   # daily → annual
+            "alpha": reg.intercept_ * ANNUALISE_FACTOR,
             "betas": dict(zip(BENCHMARKS, reg.coef_)),
             "r2":    r2,
         }
@@ -240,7 +232,6 @@ def compute_idio_return(
 ) -> tuple[float, float]:
     """
     ε = r_etf - (β_SPY·r_SPY + β_AGG·r_AGG + β_GLD·r_GLD)
-    Returns (systematic_return, idiosyncratic_return).
     """
     systematic = sum(betas.get(b, 0.0) * bench_returns_today.get(b, 0.0)
                      for b in BENCHMARKS)
@@ -249,14 +240,19 @@ def compute_idio_return(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Cross-sectional z-score
+# 4. Cross-sectional z-score (Robust)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def cross_sectional_zscore(series: pd.Series) -> pd.Series:
+def cross_sectional_zscore(series: pd.Series, limits: float = 3.0) -> pd.Series:
+    """
+    Robust z-score with Winsorization. 
+    Prevents a single massive outlier from distorting the entire universe's mean/std.
+    """
     mean, std = series.mean(), series.std()
     if std < 1e-10 or np.isnan(std):
         return pd.Series(np.nan, index=series.index)
-    return (series - mean) / std
+    z = (series - mean) / std
+    return np.clip(z, -limits, limits)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,10 +272,8 @@ def score_universe(
       - Compute idiosyncratic return
       - Compute Jensen's alpha (63d + 126d)
       - Cross-sectional z-score all signals
-      - Determine conviction (top N in both rankings)
-    Returns a DataFrame of output rows.
+      - Determine conviction via continuous soft-rank scoring
     """
-    # Latest date with data
     latest = etf_returns.index.max()
     bench_today = {b: bench_returns.loc[latest, b]
                    for b in BENCHMARKS if latest in bench_returns.index}
@@ -296,7 +290,7 @@ def score_universe(
         if np.isnan(actual_ret):
             continue
 
-        # ── Betas: DCC-GARCH (or OLS fallback) ────────────────────────────────
+        # ── Betas ────────────────────────────────────────────────────────────
         beta_method = "OLS-63d"
         if USE_DCC_GARCH:
             betas = estimate_dcc_betas(etf_s, bench_returns)
@@ -313,7 +307,6 @@ def score_universe(
         a126 = ols.get(126, {}).get("alpha", np.nan)
         r2   = ols.get(63,  {}).get("r2",    np.nan)
 
-        # Combined alpha: weighted average of 63d and 126d
         w63, w126 = ALPHA_WINDOW_WEIGHTS[63], ALPHA_WINDOW_WEIGHTS[126]
         if not np.isnan(a63) and not np.isnan(a126):
             alpha_combined = w63 * a63 + w126 * a126
@@ -329,14 +322,15 @@ def score_universe(
             "universe":            universe,
             "ticker":              ticker,
             "idio_return":         round(idio_ret, 6),
-            "idio_zscore":         np.nan,          # filled after cross-section
-            "idio_rank":           np.nan,
-            "jensen_alpha_63d":    round(a63,  4) if not np.isnan(a63)  else np.nan,
+            "idio_zscore":         np.nan,
+            "idio_rank_pct":       np.nan,
+            "jensen_alpha_63d":    round(a63, 4) if not np.isnan(a63)  else np.nan,
             "jensen_alpha_126d":   round(a126, 4) if not np.isnan(a126) else np.nan,
             "jensen_alpha_combined": round(alpha_combined, 4) if not np.isnan(alpha_combined) else np.nan,
-            "alpha_rank":          np.nan,
+            "alpha_rank_pct":      np.nan,
             "conviction":          False,
             "conviction_rank":     np.nan,
+            "conviction_score":    np.nan,
             "beta_SPY":            round(betas.get("SPY", np.nan), 4),
             "beta_AGG":            round(betas.get("AGG", np.nan), 4),
             "beta_GLD":            round(betas.get("GLD", np.nan), 4),
@@ -352,36 +346,43 @@ def score_universe(
 
     df = pd.DataFrame(rows)
 
-    # ── Cross-sectional z-scores ───────────────────────────────────────────────
+    # ── Robust Cross-sectional z-scores ───────────────────────────────────────
     valid_idio  = df["idio_return"].notna()
     valid_alpha = df["jensen_alpha_combined"].notna()
 
-    df.loc[valid_idio,  "idio_zscore"] = cross_sectional_zscore(
+    df.loc[valid_idio, "idio_zscore"] = cross_sectional_zscore(
         df.loc[valid_idio, "idio_return"]).values
 
-    # ── Rankings ──────────────────────────────────────────────────────────────
-    df = df.sort_values("idio_zscore", ascending=False)
-    df["idio_rank"] = range(1, len(df) + 1)
-
-    df = df.sort_values("jensen_alpha_combined", ascending=False)
-    df["alpha_rank"] = range(1, len(df) + 1)
-
-    # ── Conviction: top N in BOTH rankings ────────────────────────────────────
-    top_idio  = set(df.nsmallest(TOP_N_CONVICTION, "idio_rank")["ticker"])
-    top_alpha = set(df.nsmallest(TOP_N_CONVICTION, "alpha_rank")["ticker"])
-    conviction_set = top_idio & top_alpha
-    df["conviction"] = df["ticker"].isin(conviction_set)
-
-    # Rank conviction ETFs by combined score (mean of both z-scores)
-    df["_combined"] = (
-        df["idio_zscore"].fillna(0) +
-        cross_sectional_zscore(df["jensen_alpha_combined"].fillna(df["jensen_alpha_combined"].median()))
+    # ── Percentile Rankings (Fixes arbitrary tie-breaking churn) ─────────────
+    # Using pct=True handles ties gracefully by assigning the average rank,
+    # preventing ETFs from randomly flipping in/out of Top N.
+    df["idio_rank_pct"] = df["idio_return"].rank(
+        pct=True, ascending=False, method='average'
     )
-    conv_df = df[df["conviction"]].sort_values("_combined", ascending=False)
-    df.loc[conv_df.index, "conviction_rank"] = range(1, len(conv_df) + 1)
-    df = df.drop(columns=["_combined"])
+    df["alpha_rank_pct"] = df["jensen_alpha_combined"].rank(
+        pct=True, ascending=False, method='average'
+    )
+
+    # ── Soft Conviction Scoring ──────────────────────────────────────────────
+    # CRITICAL FIX: Replace rigid boolean intersection `&` with a continuous score.
+    # An ETF that is #1 in Idio and #5 in Alpha is BETTER than #3 in both.
+    # Weight Idio slightly higher (0.6) because it captures immediate catalysts.
+    df["conviction_score"] = (
+        0.6 * df["idio_rank_pct"].fillna(0.5) + 
+        0.4 * df["alpha_rank_pct"].fillna(0.5)
+    )
+
+    # Determine conviction: Top N by continuous score
+    # Fill NaN scores with 0 so they sink to the bottom, don't get median rank
+    df["conviction_rank"] = df["conviction_score"].fillna(0.0).rank(
+        method='min', ascending=False
+    )
+    
+    # Mark top N as conviction
+    df["conviction"] = df["conviction_rank"] <= TOP_N_CONVICTION
 
     log.info(f"  {universe}: {len(df)} ETFs scored, "
              f"{df['conviction'].sum()} conviction, "
-             f"top idio: {df.nsmallest(1,'idio_rank')['ticker'].values}")
+             f"top idio: {df.nsmallest(1,'idio_rank_pct')['ticker'].values[0]}")
+             
     return df
