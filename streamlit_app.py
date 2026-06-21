@@ -105,7 +105,7 @@ st.sidebar.markdown("- **Beta model:** DCC-GARCH(1,1) → OLS fallback")
 st.sidebar.markdown("- **Benchmarks:** SPY · AGG · GLD")
 st.sidebar.markdown("- **OLS windows:** 63d + 126d")
 st.sidebar.markdown("- **DCC lookback:** 252d")
-st.sidebar.markdown("- **Conviction:** top 5 in both rankings")
+st.sidebar.markdown("- **Conviction:** Continuous weighted score (Top 5)")
 st.sidebar.divider()
 st.sidebar.markdown("[GitHub](https://github.com/P2SAMAPA/P2-ETF-IDIOSYN-ALPHA-ENGINE) · [HF Dataset](https://huggingface.co/datasets/P2SAMAPA/p2-etf-idiosyn-alpha-engine-results)")
 
@@ -119,7 +119,7 @@ st.markdown("""
 <b>Three signals, one engine:</b>
 &nbsp;<b>Idiosyncratic return (ε)</b> — today's residual after stripping market, duration and commodity beta. High ε = genuine outperformance right now.
 &nbsp;·&nbsp;<b>Jensen's alpha</b> — rolling OLS intercept annualised over 63d + 126d. Persistent positive alpha = structural edge independent of factor exposure.
-&nbsp;·&nbsp;<b>Conviction</b> — ETFs in the top 5 of <i>both</i> rankings simultaneously. Strongest signal: an ETF generating persistent alpha AND showing idiosyncratic outperformance today.
+&nbsp;·&nbsp;<b>Conviction</b> — a continuous score combining Idiosyncratic and Alpha percentile ranks. Prevents missing high-quality signals that aren't strictly #1 in both on the exact same day.
 </div>
 """, unsafe_allow_html=True)
 
@@ -134,7 +134,10 @@ def hero_block(rows: pd.DataFrame, theme: str, section_label: str,
     html = f'<div class="hero-{theme}">'
     html += f'<div class="hc-section">{section_label}</div>'
     for _, row in rows.head(3).iterrows():
-        rank  = int(row.get(rank_col, 0)) if not pd.isna(row.get(rank_col, np.nan)) else "—"
+        # CRITICAL FIX: Ranks are now percentiles (0.0 to 1.0), display as percentage
+        rank_val = row.get(rank_col, np.nan)
+        rank_str = f"{rank_val:.0%}" if not pd.isna(rank_val) else "—"
+        
         val   = row.get(val_col, np.nan)
         bspy  = row.get("beta_SPY", np.nan)
         bagg  = row.get("beta_AGG", np.nan)
@@ -145,7 +148,7 @@ def hero_block(rows: pd.DataFrame, theme: str, section_label: str,
         if not pd.isna(bagg): betas_str += f"β_AGG {bagg:.2f} "
         if not pd.isna(bgld): betas_str += f"β_GLD {bgld:.2f}"
         html += f"""
-        <div class="hc-rank">#{rank}</div>
+        <div class="hc-rank">Rank: {rank_str}</div>
         <div class="hc-ticker">{row['ticker']}</div>
         <div class="hc-val">{val_label}: {val_str}</div>
         <div class="hc-sub">{betas_str}</div>
@@ -159,25 +162,27 @@ combined_latest = get_latest(df, "combined")
 col_idio, col_alpha, col_conv = st.columns(3)
 
 with col_idio:
-    top_idio = combined_latest.nsmallest(3, "idio_rank") if not combined_latest.empty else pd.DataFrame()
+    # CRITICAL FIX: Use nlargest on percentiles (higher % = better rank)
+    top_idio = combined_latest.nlargest(3, "idio_rank_pct") if not combined_latest.empty else pd.DataFrame()
     st.markdown(hero_block(top_idio, "idio", "🔵 Today's idiosyncratic return",
-                           "idio_rank", "idio_return", "ε today", "{:+.4f}"), unsafe_allow_html=True)
+                           "idio_rank_pct", "idio_return", "ε today", "{:+.4f}"), unsafe_allow_html=True)
 
 with col_alpha:
-    top_alpha = combined_latest.nsmallest(3, "alpha_rank") if not combined_latest.empty else pd.DataFrame()
+    # CRITICAL FIX: Use nlargest on percentiles
+    top_alpha = combined_latest.nlargest(3, "alpha_rank_pct") if not combined_latest.empty else pd.DataFrame()
     st.markdown(hero_block(top_alpha, "alpha", "🟢 Persistent Jensen's alpha",
-                           "alpha_rank", "jensen_alpha_combined", "α p.a.", "{:+.2%}"), unsafe_allow_html=True)
+                           "alpha_rank_pct", "jensen_alpha_combined", "α p.a.", "{:+.2%}"), unsafe_allow_html=True)
 
 with col_conv:
     conv_df = combined_latest[combined_latest["conviction"] == True].sort_values("conviction_rank") \
               if not combined_latest.empty else pd.DataFrame()
     if conv_df.empty:
-        st.markdown('<div class="hero-conv"><div class="hc-section">⭐ Conviction — top 5 in both</div>'
+        st.markdown('<div class="hero-conv"><div class="hc-section">⭐ Conviction — Top Score</div>'
                     '<div class="hc-val" style="opacity:.7">No conviction ETFs today</div></div>',
                     unsafe_allow_html=True)
     else:
-        st.markdown(hero_block(conv_df, "conv", "⭐ Conviction — top 5 in both",
-                               "conviction_rank", "jensen_alpha_combined", "α p.a.", "{:+.2%}"),
+        st.markdown(hero_block(conv_df, "conv", "⭐ Conviction — Top Score",
+                               "conviction_rank", "conviction_score", "Score", "{:.2f}"),
                     unsafe_allow_html=True)
 
 st.divider()
@@ -203,7 +208,8 @@ def render_tab(latest: pd.DataFrame):
 
     with c1:
         st.markdown("#### Idiosyncratic return (ε) today")
-        s = latest.sort_values("idio_rank")
+        # CRITICAL FIX: Sort by new percentile column (descending)
+        s = latest.sort_values("idio_rank_pct", ascending=False)
         colors = ["#1D9E75" if v > 0 else "#d62728" for v in s["idio_return"]]
         fig = go.Figure(go.Bar(
             x=s["idio_return"], y=s["ticker"], orientation="h",
@@ -218,7 +224,8 @@ def render_tab(latest: pd.DataFrame):
 
     with c2:
         st.markdown("#### Jensen's alpha (annualised, combined)")
-        s2 = latest.sort_values("alpha_rank")
+        # CRITICAL FIX: Sort by new percentile column (descending)
+        s2 = latest.sort_values("alpha_rank_pct", ascending=False)
         colors2 = ["#1D9E75" if v > 0 else "#d62728"
                    for v in s2["jensen_alpha_combined"].fillna(0)]
         fig2 = go.Figure(go.Bar(
@@ -257,7 +264,7 @@ def render_tab(latest: pd.DataFrame):
     # ── Conviction ETFs highlight ─────────────────────────────────────────────
     conv = latest[latest["conviction"] == True].sort_values("conviction_rank")
     if not conv.empty:
-        st.markdown("#### ⭐ Conviction ETFs — top 5 in both rankings")
+        st.markdown("#### ⭐ Conviction ETFs — Top Continuous Score")
         cols = st.columns(min(5, len(conv)))
         for i, (_, row) in enumerate(conv.iterrows()):
             with cols[i]:
@@ -265,10 +272,12 @@ def render_tab(latest: pd.DataFrame):
                     if not pd.isna(row["jensen_alpha_combined"]) else "—"
                 idio_str  = f"{row['idio_return']:+.4f}" \
                     if not pd.isna(row["idio_return"]) else "—"
+                score_str = f"{row['conviction_score']:.2f}" \
+                    if not pd.isna(row["conviction_score"]) else "—"
                 st.markdown(f"""
                 <div style="background:linear-gradient(135deg,#7b2d8b,#5c1f69);border-radius:10px;
                             padding:.9rem;color:white;text-align:center">
-                  <div style="font-size:.65rem;opacity:.7">#{int(row['conviction_rank']) if not pd.isna(row['conviction_rank']) else '?'}</div>
+                  <div style="font-size:.65rem;opacity:.7">Score: {score_str}</div>
                   <div style="font-size:1.4rem;font-weight:700">{row['ticker']}</div>
                   <div style="font-size:.78rem;opacity:.85">α {alpha_str}</div>
                   <div style="font-size:.72rem;opacity:.7">ε {idio_str}</div>
@@ -276,17 +285,25 @@ def render_tab(latest: pd.DataFrame):
 
     # ── Full table ────────────────────────────────────────────────────────────
     with st.expander("Full rankings table"):
-        show = ["ticker","idio_rank","idio_return","idio_zscore",
-                "alpha_rank","jensen_alpha_combined","jensen_alpha_63d","jensen_alpha_126d",
-                "conviction","beta_SPY","beta_AGG","beta_GLD","r_squared_63d","beta_method"]
+        # CRITICAL FIX: Updated column names in the show list
+        show = ["ticker","idio_rank_pct","idio_return","idio_zscore",
+                "alpha_rank_pct","jensen_alpha_combined","jensen_alpha_63d","jensen_alpha_126d",
+                "conviction","conviction_score","beta_SPY","beta_AGG","beta_GLD","r_squared_63d","beta_method"]
         show = [c for c in show if c in latest.columns]
+        
+        # Format percentiles to look clean in the table (e.g., 85.0%)
+        display_df = latest[show].sort_values("idio_rank_pct", ascending=False)
+        
         st.dataframe(
-            latest[show].sort_values("idio_rank").style.format({
+            display_df.style.format({
+                "idio_rank_pct":         "{:.0%}",
                 "idio_return":             "{:+.5f}",
                 "idio_zscore":             "{:.3f}",
+                "alpha_rank_pct":         "{:.0%}",
                 "jensen_alpha_combined":   "{:+.2%}",
                 "jensen_alpha_63d":        "{:+.2%}",
                 "jensen_alpha_126d":       "{:+.2%}",
+                "conviction_score":        "{:.2f}",
                 "beta_SPY":                "{:.3f}",
                 "beta_AGG":                "{:.3f}",
                 "beta_GLD":                "{:.3f}",
