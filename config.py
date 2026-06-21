@@ -30,27 +30,17 @@ OLS_WINDOWS = [63, 126]          # short and medium — used for rolling beta + 
 PRIMARY_WINDOW = 63              # window used for today's idiosyncratic return
 
 # ── DCC-GARCH settings ────────────────────────────────────────────────────────
-# DCC-GARCH gives time-varying betas that update daily.
-# DCC parameters (a, b) are re-estimated via MLE on each daily run using
-# scipy L-BFGS-B optimisation of the Engle (2002) DCC log-likelihood.
-# This adds ~10-15 min to runtime but gives optimal parameters for the
-# current 252-day window rather than using fixed typical values.
-# Falls back to rolling OLS if arch fitting or MLE fails.
 USE_DCC_GARCH      = True
 DCC_LOOKBACK_DAYS  = 252         # data window fed to DCC-GARCH
 GARCH_P            = 1           # GARCH(p,q) order
 GARCH_Q            = 1
-# DCC_A and DCC_B are no longer fixed — estimated daily via MLE.
 DCC_MLE_X0         = [0.05, 0.93]       # MLE starting point (typical values)
 DCC_MLE_BOUNDS     = [(1e-4, 0.4), (1e-4, 0.9999)]  # bounds for (a, b)
 DCC_MLE_MAXITER    = 200
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
-# Idiosyncratic return (ε): cross-sectional z-score of today's residual
-# Jensen's alpha: annualised OLS intercept (63d and 126d, weighted average)
-# Conviction score: ETFs appearing in top N of BOTH rankings simultaneously
 ALPHA_WINDOW_WEIGHTS = {63: 0.4, 126: 0.6}   # longer window weighted more
-TOP_N_CONVICTION     = 5                       # top N in each ranking for conviction filter
+TOP_N_CONVICTION     = 5                       # top N in combined ranking for conviction filter
 ANNUALISE_FACTOR     = 252                     # daily → annual
 
 # ── Output columns ────────────────────────────────────────────────────────────
@@ -59,15 +49,16 @@ OUTPUT_COLS = [
     # Today's idiosyncratic signal
     "idio_return",          # raw residual ε today
     "idio_zscore",          # cross-sectional z-score of ε (main ranking signal 1)
-    "idio_rank",            # rank by idio_zscore within universe
+    "idio_rank_pct",        # PERCENTILE rank by idio_return within universe (v2.0 - prevents tie churn)
     # Structural Jensen's alpha
     "jensen_alpha_63d",     # annualised OLS intercept, 63-day window
     "jensen_alpha_126d",    # annualised OLS intercept, 126-day window
     "jensen_alpha_combined",# weighted average of above (main ranking signal 2)
-    "alpha_rank",           # rank by jensen_alpha_combined within universe
-    # Conviction (intersection signal)
-    "conviction",           # True if in top N of BOTH rankings
+    "alpha_rank_pct",       # PERCENTILE rank by jensen_alpha_combined within universe (v2.0 - prevents tie churn)
+    # Conviction (continuous soft-score intersection signal)
+    "conviction",           # True if in top N of combined score
     "conviction_rank",      # rank among conviction ETFs (by combined score)
+    "conviction_score",     # Continuous 0-1 weighted score of Idio + Alpha percentiles (v2.0)
     # Beta exposures (from DCC-GARCH or OLS fallback)
     "beta_SPY", "beta_AGG", "beta_GLD",
     # Model quality
@@ -79,7 +70,4 @@ OUTPUT_COLS = [
 ]
 
 # ── CPU budget ────────────────────────────────────────────────────────────────
-# GitHub free tier: 2 vCPU, 7GB RAM, 6h limit.
-# DCC-GARCH on 20 ETFs × 3 benchmarks: ~15-20 min.
-# Total expected: ~25 min including data load + OLS + push.
 MAX_RUNTIME_MINUTES = 300
